@@ -5,9 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
-	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/dundee/gdu/v5/internal/common"
 	"github.com/dundee/gdu/v5/pkg/analyze"
 	"github.com/dundee/gdu/v5/pkg/device"
+	"github.com/dundee/gdu/v5/pkg/fs"
 	"github.com/fatih/color"
 )
 
@@ -29,12 +31,20 @@ type UI struct {
 }
 
 // CreateExportUI creates UI for stdout
-func CreateExportUI(output io.Writer, exportOutput io.Writer, showProgress bool) *UI {
+func CreateExportUI(
+	output io.Writer,
+	exportOutput io.Writer,
+	useColors bool,
+	showProgress bool,
+	constGC bool,
+	useSIPrefix bool,
+) *UI {
 	ui := &UI{
 		UI: &common.UI{
 			ShowProgress: showProgress,
 			Analyzer:     analyze.CreateAnalyzer(),
-			PathChecker:  os.Stat,
+			ConstGC:      constGC,
+			UseSIPrefix:  useSIPrefix,
 		},
 		output:       output,
 		exportOutput: exportOutput,
@@ -42,6 +52,10 @@ func CreateExportUI(output io.Writer, exportOutput io.Writer, showProgress bool)
 	}
 	ui.red = color.New(color.FgRed).Add(color.Bold)
 	ui.orange = color.New(color.FgYellow).Add(color.Bold)
+
+	if !useColors {
+		color.NoColor = true
+	}
 
 	return ui
 }
@@ -61,19 +75,36 @@ func (ui *UI) ReadAnalysis(input io.Reader) error {
 	return errors.New("Reading analysis is not possible while exporting")
 }
 
-// AnalyzePath analyzes recursively disk usage in given path
-func (ui *UI) AnalyzePath(path string, _ *analyze.Dir) error {
-	var (
-		dir         *analyze.Dir
-		wait        sync.WaitGroup
-		waitWritten sync.WaitGroup
-	)
-	abspath, _ := filepath.Abs(path)
+// ReadFromStorage reads analysis data from persistent key-value storage
+func (ui *UI) ReadFromStorage(storagePath, path string) error {
+	storage := analyze.NewStorage(storagePath, path)
+	closeFn := storage.Open()
+	defer closeFn()
 
-	_, err := ui.PathChecker(abspath)
+	dir, err := storage.GetDirForPath(path)
 	if err != nil {
 		return err
 	}
+
+	var waitWritten sync.WaitGroup
+	if ui.ShowProgress {
+		waitWritten.Add(1)
+		go func() {
+			defer waitWritten.Done()
+			ui.updateProgress()
+		}()
+	}
+
+	return ui.exportDir(dir, &waitWritten)
+}
+
+// AnalyzePath analyzes recursively disk usage in given path
+func (ui *UI) AnalyzePath(path string, _ fs.Item) error {
+	var (
+		dir         fs.Item
+		wait        sync.WaitGroup
+		waitWritten sync.WaitGroup
+	)
 
 	if ui.ShowProgress {
 		waitWritten.Add(1)
@@ -86,22 +117,30 @@ func (ui *UI) AnalyzePath(path string, _ *analyze.Dir) error {
 	wait.Add(1)
 	go func() {
 		defer wait.Done()
-		dir = ui.Analyzer.AnalyzeDir(abspath, ui.CreateIgnoreFunc())
+		dir = ui.Analyzer.AnalyzeDir(path, ui.CreateIgnoreFunc(), ui.ConstGC)
+		dir.UpdateStats(make(fs.HardLinkedItems, 10))
 	}()
 
 	wait.Wait()
 
-	sort.Sort(dir.Files)
+	return ui.exportDir(dir, &waitWritten)
+}
 
-	var buff bytes.Buffer
+func (ui *UI) exportDir(dir fs.Item, waitWritten *sync.WaitGroup) error {
+	sort.Sort(sort.Reverse(dir.GetFiles()))
+
+	var (
+		buff bytes.Buffer
+		err  error
+	)
 
 	buff.Write([]byte(`[1,2,{"progname":"gdu","progver":"`))
 	buff.Write([]byte(build.Version))
 	buff.Write([]byte(`","timestamp":`))
-	buff.Write([]byte(fmt.Sprint(time.Now().Unix())))
+	buff.Write([]byte(strconv.FormatInt(time.Now().Unix(), 10)))
 	buff.Write([]byte("},\n"))
 
-	if err = dir.EncodeJSON(&buff, true); err != nil {
+	if err := dir.EncodeJSON(&buff, true); err != nil {
 		return err
 	}
 	if _, err = buff.Write([]byte("]\n")); err != nil {
@@ -111,9 +150,11 @@ func (ui *UI) AnalyzePath(path string, _ *analyze.Dir) error {
 		return err
 	}
 
-	switch f := ui.exportOutput.(type) {
-	case *os.File:
-		f.Close()
+	if f, ok := ui.exportOutput.(*os.File); ok {
+		err = f.Close()
+		if err != nil {
+			return err
+		}
 	}
 
 	if ui.ShowProgress {
@@ -135,9 +176,9 @@ func (ui *UI) updateProgress() {
 	progressRunes := []rune(`⠇⠏⠋⠙⠹⠸⠼⠴⠦⠧`)
 
 	progressChan := ui.Analyzer.GetProgressChan()
-	doneChan := ui.Analyzer.GetDoneChan()
+	doneChan := ui.Analyzer.GetDone()
 
-	var progress analyze.CurrentProgress
+	var progress common.CurrentProgress
 
 	i := 0
 	for {
@@ -160,7 +201,7 @@ func (ui *UI) updateProgress() {
 			fmt.Fprint(ui.output, "Writing output file...")
 		} else {
 			fmt.Fprint(ui.output, "Scanning... Total items: "+
-				ui.red.Sprint(progress.ItemCount)+
+				ui.red.Sprint(common.FormatNumber(int64(progress.ItemCount)))+
 				" size: "+
 				ui.formatSize(progress.TotalSize))
 		}
@@ -172,21 +213,51 @@ func (ui *UI) updateProgress() {
 }
 
 func (ui *UI) formatSize(size int64) string {
+	if ui.UseSIPrefix {
+		return ui.formatWithDecPrefix(size)
+	}
+	return ui.formatWithBinPrefix(size)
+}
+
+func (ui *UI) formatWithBinPrefix(size int64) string {
 	fsize := float64(size)
+	asize := math.Abs(fsize)
 
 	switch {
-	case fsize >= common.EB:
-		return ui.orange.Sprintf("%.1f", fsize/common.EB) + " EiB"
-	case fsize >= common.PB:
-		return ui.orange.Sprintf("%.1f", fsize/common.PB) + " PiB"
-	case fsize >= common.TB:
-		return ui.orange.Sprintf("%.1f", fsize/common.TB) + " TiB"
-	case fsize >= common.GB:
-		return ui.orange.Sprintf("%.1f", fsize/common.GB) + " GiB"
-	case fsize >= common.MB:
-		return ui.orange.Sprintf("%.1f", fsize/common.MB) + " MiB"
-	case fsize >= common.KB:
-		return ui.orange.Sprintf("%.1f", fsize/common.KB) + " KiB"
+	case asize >= common.Ei:
+		return ui.orange.Sprintf("%.1f", fsize/common.Ei) + " EiB"
+	case asize >= common.Pi:
+		return ui.orange.Sprintf("%.1f", fsize/common.Pi) + " PiB"
+	case asize >= common.Ti:
+		return ui.orange.Sprintf("%.1f", fsize/common.Ti) + " TiB"
+	case asize >= common.Gi:
+		return ui.orange.Sprintf("%.1f", fsize/common.Gi) + " GiB"
+	case asize >= common.Mi:
+		return ui.orange.Sprintf("%.1f", fsize/common.Mi) + " MiB"
+	case asize >= common.Ki:
+		return ui.orange.Sprintf("%.1f", fsize/common.Ki) + " KiB"
+	default:
+		return ui.orange.Sprintf("%d", size) + " B"
+	}
+}
+
+func (ui *UI) formatWithDecPrefix(size int64) string {
+	fsize := float64(size)
+	asize := math.Abs(fsize)
+
+	switch {
+	case asize >= common.E:
+		return ui.orange.Sprintf("%.1f", fsize/common.E) + " EB"
+	case asize >= common.P:
+		return ui.orange.Sprintf("%.1f", fsize/common.P) + " PB"
+	case asize >= common.T:
+		return ui.orange.Sprintf("%.1f", fsize/common.T) + " TB"
+	case asize >= common.G:
+		return ui.orange.Sprintf("%.1f", fsize/common.G) + " GB"
+	case asize >= common.M:
+		return ui.orange.Sprintf("%.1f", fsize/common.M) + " MB"
+	case asize >= common.K:
+		return ui.orange.Sprintf("%.1f", fsize/common.K) + " kB"
 	default:
 		return ui.orange.Sprintf("%d", size) + " B"
 	}
